@@ -42,6 +42,79 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     /// This queue is user initiated because it is tied to an ``AVCaptureSession``.
     private let sampleBufferQueue = DispatchQueue(label: "com.juliansteenbakker.mobile_scanner.captureOutputQueue", qos: .userInitiated)
 
+    private class ImageCaptureRequest {
+        let result: FlutterResult
+        var claimed = false
+        var timeout: DispatchWorkItem?
+
+        init(_ result: @escaping FlutterResult) { self.result = result }
+    }
+
+    private let imageCaptureLock = NSLock()
+    private var pendingImageCapture: ImageCaptureRequest?
+
+    private func captureImage(_ result: @escaping FlutterResult) {
+        guard !stopped, captureSession?.isRunning == true else {
+            result(FlutterError(code: MobileScannerErrorCodes.GENERIC_ERROR,
+                                message: "The camera is not running.", details: nil))
+            return
+        }
+        imageCaptureLock.lock()
+        guard pendingImageCapture == nil else {
+            imageCaptureLock.unlock()
+            result(FlutterError(code: MobileScannerErrorCodes.GENERIC_ERROR,
+                                message: "An image capture is already pending.", details: nil))
+            return
+        }
+        let request = ImageCaptureRequest(result)
+        pendingImageCapture = request
+        imageCaptureLock.unlock()
+
+        let timeout = DispatchWorkItem { [weak self, weak request] in
+            guard let request else { return }
+            self?.completeImageCapture(request, error: "Image capture timed out.")
+        }
+        request.timeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+    }
+
+    // Called on the main queue, including for replies from the sample buffer queue.
+    private func completeImageCapture(_ request: ImageCaptureRequest, bytes: Data? = nil, error: String? = nil) {
+        imageCaptureLock.lock()
+        guard pendingImageCapture === request else {
+            imageCaptureLock.unlock()
+            return
+        }
+        pendingImageCapture = nil
+        imageCaptureLock.unlock()
+        request.timeout?.cancel()
+        if let bytes {
+            request.result(FlutterStandardTypedData(bytes: bytes))
+        } else {
+            request.result(FlutterError(code: MobileScannerErrorCodes.GENERIC_ERROR,
+                                       message: error, details: nil))
+        }
+    }
+
+    private func captureNextImage(_ buffer: CVPixelBuffer) {
+        imageCaptureLock.lock()
+        guard let request = pendingImageCapture, !request.claimed else {
+            imageCaptureLock.unlock()
+            return
+        }
+        request.claimed = true
+        imageCaptureLock.unlock()
+
+        // Encode on the existing sample buffer queue, before barcode filtering.
+        var image: CGImage?
+        let status = VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &image)
+        let bytes = status == kCVReturnSuccess ? image?.jpegData(compressionQuality: 0.8) : nil
+        DispatchQueue.main.async { [weak self] in
+            self?.completeImageCapture(request, bytes: bytes,
+                                       error: "Could not encode the camera frame as JPEG.")
+        }
+    }
+
     /// The dispatch queue that calls ``AVCaptureSession/startRunning()``.
     ///
     /// This queue is user initiated because the user is waiting for the preview.
@@ -174,6 +247,8 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
             updateScanWindow(call, result)
         case "analyzeImage":
             analyzeImage(call, result)
+        case "captureImage":
+            captureImage(result)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -254,6 +329,7 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         }
         latestBuffer = imageBuffer
         notifyFrameAvailable(for: textureId)
+        captureNextImage(imageBuffer)
 
         let currentTime = Date().timeIntervalSince1970
         let eligibleForScan = currentTime > nextScanTime && !imagesCurrentlyBeingProcessed
@@ -970,6 +1046,12 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
     }
 
     private func releaseCamera() {
+        imageCaptureLock.lock()
+        let request = pendingImageCapture
+        imageCaptureLock.unlock()
+        if let request {
+            completeImageCapture(request, error: "The camera stopped during image capture.")
+        }
 #if os(iOS)
         removeInterfaceOrientationObserver()
 #endif

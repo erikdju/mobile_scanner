@@ -55,6 +55,10 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
   @visibleForTesting
   static const String kAnalyzeImageMethodName = 'analyzeImage';
 
+  /// The name of the method that captures the next camera frame.
+  @visibleForTesting
+  static const String kCaptureImageMethodName = 'captureImage';
+
   /// The name of the method that resets the zoom scale.
   @visibleForTesting
   static const String kResetScaleMethodName = 'resetScale';
@@ -306,6 +310,33 @@ class MethodChannelMobileScanner extends MobileScannerPlatform {
       }
 
       return null;
+    }
+  }
+
+  @override
+  Future<Uint8List> captureImage() async {
+    try {
+      final bytes = await methodChannel.invokeMethod<Uint8List>(
+        kCaptureImageMethodName,
+      );
+      if (bytes == null || bytes.isEmpty) {
+        throw const MobileScannerException(
+          errorCode: MobileScannerErrorCode.genericError,
+          errorDetails: MobileScannerErrorDetails(
+            message: 'The camera returned an empty image.',
+          ),
+        );
+      }
+      return bytes;
+    } on PlatformException catch (error) {
+      throw MobileScannerException(
+        errorCode: MobileScannerErrorCode.fromPlatformException(error),
+        errorDetails: MobileScannerErrorDetails(
+          code: error.code,
+          message: error.message,
+          details: error.details,
+        ),
+      );
     }
   }
 

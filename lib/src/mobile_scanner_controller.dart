@@ -390,6 +390,30 @@ class MobileScannerController extends ValueNotifier<MobileScannerState> {
     return MobileScannerPlatform.instance.analyzeImage(path, formats: formats);
   }
 
+  /// Captures the next camera frame as JPEG bytes, independently of barcodes.
+  ///
+  /// Captures the full frame at the analysis resolution, without applying the
+  /// scan window or preview cropping. Does not require [returnImage].
+  ///
+  /// Throws a [MobileScannerException] if the controller is uninitialized,
+  /// disposed, or the camera is not running. Also throws if another capture is
+  /// pending, encoding fails, the camera stops, or no frame arrives within
+  /// five seconds.
+  Future<Uint8List> captureImage() async {
+    _throwIfNotInitialized();
+
+    if (!value.isRunning) {
+      throw const MobileScannerException(
+        errorCode: MobileScannerErrorCode.genericError,
+        errorDetails: MobileScannerErrorDetails(
+          message: 'Cannot capture an image when the camera is not running.',
+        ),
+      );
+    }
+
+    return MobileScannerPlatform.instance.captureImage();
+  }
+
   /// Build a camera preview widget.
   Widget buildCameraView() {
     _throwIfNotInitialized();

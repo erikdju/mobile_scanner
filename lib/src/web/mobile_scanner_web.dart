@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
+import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/widgets.dart';
@@ -80,6 +82,85 @@ class MobileScannerWeb extends MobileScannerPlatform {
 
   /// The video element for the camera view.
   late HTMLVideoElement _videoElement;
+
+  HTMLVideoElement? _captureVideoElement;
+  void Function()? _cancelImageCapture;
+
+  @override
+  Future<Uint8List> captureImage() async {
+    final video = _captureVideoElement;
+    if (video == null || video.paused || video.videoWidth == 0) {
+      throw _imageCaptureError('The camera is not running.');
+    }
+    if (_cancelImageCapture != null) {
+      throw _imageCaptureError('An image capture is already pending.');
+    }
+
+    final result = Completer<Uint8List>();
+    int? callbackId;
+    final timeout = Timer(const Duration(seconds: 5), () {
+      if (!result.isCompleted) {
+        result.completeError(_imageCaptureError('Image capture timed out.'));
+      }
+    });
+    _cancelImageCapture = () {
+      if (!result.isCompleted) {
+        result.completeError(
+          _imageCaptureError('The camera stopped during image capture.'),
+        );
+      }
+    };
+
+    try {
+      callbackId = video.requestVideoFrameCallback(
+        (
+          double now,
+          JSObject metadata,
+        ) {
+          if (result.isCompleted) return;
+          try {
+            final canvas =
+                HTMLCanvasElement()
+                  ..width = video.videoWidth
+                  ..height = video.videoHeight;
+            (canvas.getContext('2d')! as CanvasRenderingContext2D).drawImage(
+              video,
+              0,
+              0,
+            );
+            final data = canvas.toDataURL('image/jpeg', 0.8.toJS);
+            if (!data.startsWith('data:image/jpeg;base64,')) {
+              throw _imageCaptureError('Could not encode the frame as JPEG.');
+            }
+            result.complete(
+              base64Decode(data.substring(data.indexOf(',') + 1)),
+            );
+          } on Object catch (error, stackTrace) {
+            result.completeError(
+              _imageCaptureError(error.toString()),
+              stackTrace,
+            );
+          }
+        }.toJS,
+      );
+      return await result.future;
+    } on MobileScannerException {
+      rethrow;
+    } on Object catch (error) {
+      throw _imageCaptureError(error.toString());
+    } finally {
+      timeout.cancel();
+      if (callbackId != null) video.cancelVideoFrameCallback(callbackId);
+      _cancelImageCapture = null;
+    }
+  }
+
+  MobileScannerException _imageCaptureError(String message) {
+    return MobileScannerException(
+      errorCode: MobileScannerErrorCode.genericError,
+      errorDetails: MobileScannerErrorDetails(message: message),
+    );
+  }
 
   /// Storage for the preferred camera device ID across sessions.
   static const PreferredDeviceStorage _preferredDeviceStorage =
@@ -443,6 +524,7 @@ class MobileScannerWeb extends MobileScannerPlatform {
         await _barcodeReader?.resume();
         // Paused in pause(), so no barcodes would be delivered otherwise.
         _barcodesSubscription?.resume();
+        _captureVideoElement = _videoElement;
 
         final cameraDirection = _settingsDelegate.getCameraDirection(
           _barcodeReader?.videoStream,
@@ -609,6 +691,7 @@ class MobileScannerWeb extends MobileScannerPlatform {
 
       // The torch setup awaits, so a stop can still land here.
       _throwIfTornDown(generation);
+      _captureVideoElement = _videoElement;
 
       return viewAttributes;
     } catch (_) {
@@ -656,12 +739,16 @@ class MobileScannerWeb extends MobileScannerPlatform {
 
   @override
   Future<void> pause() async {
+    _captureVideoElement = null;
+    _cancelImageCapture?.call();
     _barcodesSubscription?.pause();
     _barcodeReader?.pause();
   }
 
   @override
   Future<void> stop() async {
+    _captureVideoElement = null;
+    _cancelImageCapture?.call();
     // Signal any in-flight start() that its camera is no longer wanted.
     _teardownGeneration++;
 

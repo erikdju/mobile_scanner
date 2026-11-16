@@ -49,6 +49,7 @@ import dev.steenbakker.mobile_scanner.utils.invertBitmapColors
 import dev.steenbakker.mobile_scanner.utils.rotateBitmap
 import dev.steenbakker.mobile_scanner.utils.serialize
 import io.flutter.view.TextureRegistry
+import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -56,6 +57,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 class MobileScanner(
@@ -87,6 +89,75 @@ class MobileScanner(
     private var analysisExecutor = Executors.newSingleThreadExecutor()
     private var autoTorch: AutoTorch? = null
     private var torchStateCallback: TorchStateCallback? = null
+
+    private class ImageCaptureRequest(val result: MethodChannel.Result) {
+        val claimed = AtomicBoolean(false)
+        var timeout: Runnable? = null
+    }
+
+    private val pendingImageCapture = AtomicReference<ImageCaptureRequest?>(null)
+    private val captureHandler = Handler(Looper.getMainLooper())
+
+    fun captureImage(result: MethodChannel.Result) {
+        if (camera == null || imageAnalysis == null || isPaused) {
+            result.error(MobileScannerErrorCodes.GENERIC_ERROR, "The camera is not running.", null)
+            return
+        }
+        val request = ImageCaptureRequest(result)
+        if (!pendingImageCapture.compareAndSet(null, request)) {
+            result.error(MobileScannerErrorCodes.GENERIC_ERROR, "An image capture is already pending.", null)
+            return
+        }
+        val timeout = Runnable { completeImageCapture(request, message = "Image capture timed out.") }
+        request.timeout = timeout
+        captureHandler.postDelayed(timeout, 5000)
+    }
+
+    private fun completeImageCapture(
+        request: ImageCaptureRequest,
+        bytes: ByteArray? = null,
+        message: String? = null,
+    ) {
+        // Serialize replies against stop/pause and discard a late encoded frame.
+        captureHandler.post {
+            if (pendingImageCapture.compareAndSet(request, null)) {
+                request.timeout?.let { captureHandler.removeCallbacks(it) }
+                if (bytes != null) request.result.success(bytes)
+                else request.result.error(MobileScannerErrorCodes.GENERIC_ERROR, message, null)
+            }
+        }
+    }
+
+    private fun cancelImageCapture() {
+        // Called on the main thread before unbinding the camera.
+        val request = pendingImageCapture.getAndSet(null) ?: return
+        request.timeout?.let { captureHandler.removeCallbacks(it) }
+        request.result.error(MobileScannerErrorCodes.GENERIC_ERROR, "The camera stopped during image capture.", null)
+    }
+
+    private fun captureNextImage(imageProxy: ImageProxy) {
+        val request = pendingImageCapture.get() ?: return
+        if (!request.claimed.compareAndSet(false, true)) return
+
+        var bitmap: Bitmap? = null
+        var rotated: Bitmap? = null
+        try {
+            // Copy and encode while the analyzer owns the frame, before ML Kit
+            // can close it. Capture is independent of scan throttling/inversion.
+            bitmap = imageProxy.toBitmap()
+            rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            val stream = ByteArrayOutputStream()
+            check(rotated.compress(Bitmap.CompressFormat.JPEG, 80, stream)) {
+                "Could not encode the camera frame as JPEG."
+            }
+            completeImageCapture(request, bytes = stream.toByteArray())
+        } catch (error: Exception) {
+            completeImageCapture(request, message = error.localizedMessage ?: error.toString())
+        } finally {
+            rotated?.let { if (!it.isRecycled) it.recycle() }
+            bitmap?.let { if (!it.isRecycled) it.recycle() }
+        }
+    }
 
     /// Configurable variables
     var scanWindow: List<Float>? = null
@@ -124,6 +195,8 @@ class MobileScanner(
      * callback for the camera. Every frame is passed through this function.
      */
     val captureOutput = ImageAnalysis.Analyzer { imageProxy ->
+        captureNextImage(imageProxy)
+
         @androidx.annotation.OptIn(ExperimentalGetImage::class)
         val mediaImage = imageProxy.image
         if (mediaImage == null) {
@@ -645,6 +718,7 @@ class MobileScanner(
     }
 
     private fun pauseCamera() {
+        cancelImageCapture()
         stopAutoTorch()
 
         // Pause camera by unbinding all use cases
@@ -662,6 +736,7 @@ class MobileScanner(
 //    }
 
     private fun releaseCamera() {
+        cancelImageCapture()
         stopAutoTorch()
 
         val owner = activity as LifecycleOwner

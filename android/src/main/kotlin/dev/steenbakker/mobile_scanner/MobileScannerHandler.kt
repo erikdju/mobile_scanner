@@ -154,6 +154,14 @@ class MobileScannerHandler(
             "getSupportedLenses" -> getSupportedLenses(call, result)
             "getBestCloseRangeScanningLens" -> getBestCloseRangeScanningLens(result)
             "analyzeImage" -> analyzeImage(call, result)
+            "captureImage" -> {
+                val scanner = mobileScanner
+                if (scanner == null) {
+                    result.error(MobileScannerErrorCodes.GENERIC_ERROR, "The camera is not running.", null)
+                } else {
+                    scanner.captureImage(result)
+                }
+            }
             "setScale" -> setScale(call, result)
             "resetScale" -> resetScale(result)
             "updateScanWindow" -> updateScanWindow(call, result)

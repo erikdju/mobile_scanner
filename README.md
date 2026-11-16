@@ -32,6 +32,7 @@ See the example app for detailed implementation information.
 |--------------|--------------------|--------------------|--------------------|-----|
 | analyzeImage | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :x: |
 | returnImage  | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :x: |
+| captureImage | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: |
 | scanWindow   | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :x: |
 | autoZoom     | :heavy_check_mark: | :x:                | :x:                | :x: |
 | autoTorch    | :heavy_check_mark: (requires a light sensor) | :heavy_check_mark: | :heavy_check_mark: | :x: |
@@ -277,6 +278,25 @@ MobileScanner(
   },
 );
 ```
+
+#### Capturing a camera image
+
+While the controller is running, request the next camera frame as JPEG bytes:
+
+```dart
+final Uint8List jpegBytes = await controller.captureImage();
+```
+
+Capture works without a detected barcode and with `returnImage: false`. It uses
+the existing camera session and returns the full frame at the analysis resolution,
+without the scan window, preview cropping, overlays, or front camera preview
+mirroring. JPEG quality is 80%. Android applies the frame's rotation; Apple
+platforms use the existing video output orientation. Web uses the video resolution
+and requires browser support for `requestVideoFrameCallback`.
+
+Only one capture can be pending at a time. A stopped or paused camera, an
+interrupted capture, an encoding failure, or a five-second timeout throws a
+`MobileScannerException`.
 
 #### Switching lens types
 

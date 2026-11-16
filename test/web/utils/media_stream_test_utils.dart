@@ -169,7 +169,8 @@ class FailingBarcodeDetectorStub {
 /// Call [restore] in `tearDown`.
 class DetectingBarcodeDetectorStub {
   /// Install the stub.
-  DetectingBarcodeDetectorStub() : _original = _global.barcodeDetector {
+  DetectingBarcodeDetectorStub({bool returnNoBarcodes = false})
+    : _original = _global.barcodeDetector {
     // `new` needs a real JS class, which a Dart function converted with `toJS`
     // is not.
     final functionConstructor = globalContext['Function']! as JSFunction;
@@ -178,6 +179,7 @@ class DetectingBarcodeDetectorStub {
       return class {
         static async getSupportedFormats() { return ['qr_code']; }
         async detect() {
+          if ($returnNoBarcodes) return [];
           return [{
             rawValue: '$rawValue',
             format: 'qr_code',

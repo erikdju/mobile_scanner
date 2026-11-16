@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* Add `MobileScannerController.captureImage()` to capture the next camera frame
+  as JPEG bytes without requiring barcode detection or restarting the camera.
+
 ## [7.5.0](https://github.com/juliansteenbakker/mobile_scanner/compare/v7.4.4...v7.5.0) (2026-11-01)
 
 

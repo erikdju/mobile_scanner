@@ -2,11 +2,16 @@ package dev.steenbakker.mobile_scanner
 
 import android.app.Activity
 import android.graphics.Point
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.Image
+import android.os.Looper
 import android.util.Size
 import android.view.Surface
 import androidx.camera.core.ImageInfo
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Camera
 import androidx.camera.core.SurfaceRequest
 import com.google.android.gms.tasks.OnCanceledListener
 import com.google.android.gms.tasks.OnFailureListener
@@ -16,7 +21,12 @@ import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import dev.steenbakker.mobile_scanner.objects.DetectionSpeed
 import io.flutter.view.TextureRegistry
+import io.flutter.plugin.common.MethodChannel
+import androidx.lifecycle.LifecycleOwner
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -24,7 +34,9 @@ import org.junit.runner.RunWith
 import org.mockito.ArgumentCaptor
 import org.mockito.Mockito
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.time.Duration
 
 /*
  * This demonstrates a simple unit test of the Kotlin portion of this plugin's implementation.
@@ -48,7 +60,7 @@ internal class MobileScannerTest {
         },
     ): MobileScanner {
         return MobileScanner(
-            Mockito.mock(Activity::class.java),
+            Mockito.mock(Activity::class.java, Mockito.withSettings().extraInterfaces(LifecycleOwner::class.java)),
             Mockito.mock(TextureRegistry::class.java),
             { _: List<Map<String, Any?>>, _: ByteArray?, _: Int?, _: Int? -> },
             { _: String -> },
@@ -64,6 +76,150 @@ internal class MobileScannerTest {
         Mockito.`when`(barcode.cornerPoints).thenReturn(arrayOf(*cornerPoints))
 
         return barcode
+    }
+
+    private fun createRunningMobileScanner(): MobileScanner {
+        val scanner = createMobileScanner()
+        for ((name, value) in listOf(
+            "camera" to Mockito.mock(Camera::class.java),
+            "imageAnalysis" to Mockito.mock(ImageAnalysis::class.java),
+        )) {
+            MobileScanner::class.java.getDeclaredField(name).apply {
+                isAccessible = true
+                set(scanner, value)
+            }
+        }
+        return scanner
+    }
+
+    @Test
+    fun captureImage_returnsNextFrameAsRotatedJpegWithoutBarcodes() {
+        val scanner = createRunningMobileScanner()
+        val result = Mockito.mock(MethodChannel.Result::class.java)
+        val image = createImage(16, 8)
+        Mockito.`when`(image.toBitmap()).thenReturn(Bitmap.createBitmap(16, 8, Bitmap.Config.ARGB_8888))
+        Mockito.`when`(image.imageInfo.rotationDegrees).thenReturn(90)
+        // No media image / no barcode task: capture must still succeed.
+        scanner.captureOutput.analyze(createImage(16, 8))
+        scanner.captureImage(result)
+        Mockito.verifyNoInteractions(result)
+
+        scanner.captureOutput.analyze(image)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val bytes = ArgumentCaptor.forClass(ByteArray::class.java)
+        Mockito.verify(result).success(bytes.capture())
+        assertEquals(0xff, bytes.value[0].toInt() and 0xff)
+        assertEquals(0xd8, bytes.value[1].toInt() and 0xff)
+        val decoded = BitmapFactory.decodeByteArray(bytes.value, 0, bytes.value.size)
+        assertNotNull(decoded)
+        assertEquals(8, decoded.width)
+        assertEquals(16, decoded.height)
+        Mockito.verify(image).close()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
+        Mockito.verifyNoMoreInteractions(result)
+    }
+
+    @Test
+    fun captureImage_rejectsStoppedCamera() {
+        val result = Mockito.mock(MethodChannel.Result::class.java)
+        createMobileScanner().captureImage(result)
+        Mockito.verify(result).error(Mockito.anyString(), Mockito.eq("The camera is not running."), Mockito.isNull())
+    }
+
+    @Test
+    fun captureImage_ignoresBarcodeThrottlingAndInversion() {
+        val scanner = createRunningMobileScanner()
+        for ((name, value) in listOf(
+            "detectionSpeed" to DetectionSpeed.NORMAL,
+            "scannerTimeout" to true,
+            "invertImage" to true,
+        )) {
+            MobileScanner::class.java.getDeclaredField(name).apply {
+                isAccessible = true
+                set(scanner, value)
+            }
+        }
+        val result = Mockito.mock(MethodChannel.Result::class.java)
+        val image = createImage(16, 8)
+        val bitmap = Bitmap.createBitmap(16, 8, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.RED)
+        Mockito.`when`(image.toBitmap()).thenReturn(bitmap)
+        Mockito.`when`(image.image).thenReturn(Mockito.mock(Image::class.java))
+        scanner.captureImage(result)
+        scanner.captureOutput.analyze(image)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val bytes = ArgumentCaptor.forClass(ByteArray::class.java)
+        Mockito.verify(result).success(bytes.capture())
+        val decoded = BitmapFactory.decodeByteArray(bytes.value, 0, bytes.value.size)
+        // Capture uses the original frame even when scanning inverts colors.
+        assertTrue(android.graphics.Color.red(decoded.getPixel(0, 0)) > 200)
+        Mockito.verifyNoInteractions(scanner.scanner)
+        Mockito.verify(image).close()
+    }
+
+    @Test
+    fun captureImage_rejectsConcurrentRequestAndTimesOut() {
+        val scanner = createRunningMobileScanner()
+        val first = Mockito.mock(MethodChannel.Result::class.java)
+        val second = Mockito.mock(MethodChannel.Result::class.java)
+        scanner.captureImage(first)
+        scanner.captureImage(second)
+        Mockito.verify(second).error(Mockito.anyString(), Mockito.eq("An image capture is already pending."), Mockito.isNull())
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
+        Mockito.verify(first).error(Mockito.anyString(), Mockito.eq("Image capture timed out."), Mockito.isNull())
+
+        val retry = Mockito.mock(MethodChannel.Result::class.java)
+        scanner.captureImage(retry)
+        Mockito.verifyNoInteractions(retry)
+        scanner.pause(force = true)
+    }
+
+    @Test
+    fun captureImage_pauseCancelsPendingResultAndDiscardsLateSuccess() {
+        val scanner = createRunningMobileScanner()
+        val result = Mockito.mock(MethodChannel.Result::class.java)
+        val image = createImage(16, 8)
+        Mockito.`when`(image.toBitmap()).thenReturn(Bitmap.createBitmap(16, 8, Bitmap.Config.ARGB_8888))
+        scanner.captureImage(result)
+        scanner.captureOutput.analyze(image)
+
+        // Encoding has queued its reply, but pause wins on the main thread.
+        scanner.pause(force = true)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
+        Mockito.verify(result).error(Mockito.anyString(), Mockito.eq("The camera stopped during image capture."), Mockito.isNull())
+        Mockito.verifyNoMoreInteractions(result)
+    }
+
+    @Test
+    fun captureImage_stopCancelsPendingResult() {
+        val scanner = createRunningMobileScanner()
+        val result = Mockito.mock(MethodChannel.Result::class.java)
+        scanner.captureImage(result)
+        scanner.stop(force = true)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
+        Mockito.verify(result).error(Mockito.anyString(), Mockito.eq("The camera stopped during image capture."), Mockito.isNull())
+        Mockito.verifyNoMoreInteractions(result)
+    }
+
+    @Test
+    fun captureImage_encodingFailureReleasesFrameAndAllowsRetry() {
+        val scanner = createRunningMobileScanner()
+        val result = Mockito.mock(MethodChannel.Result::class.java)
+        val image = createImage(16, 8)
+        Mockito.`when`(image.toBitmap()).thenThrow(IllegalStateException("Invalid frame"))
+        scanner.captureImage(result)
+        scanner.captureOutput.analyze(image)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        Mockito.verify(result).error(Mockito.anyString(), Mockito.eq("Invalid frame"), Mockito.isNull())
+        Mockito.verify(image).close()
+        val retry = Mockito.mock(MethodChannel.Result::class.java)
+        scanner.captureImage(retry)
+        Mockito.verifyNoInteractions(retry)
+        scanner.pause(force = true)
     }
 
     private fun createImage(width: Int, height: Int): ImageProxy {

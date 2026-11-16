@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/widgets.dart';
 import 'package:mobile_scanner/src/enums/barcode_format.dart';
 import 'package:mobile_scanner/src/enums/camera_facing.dart';
@@ -60,6 +62,14 @@ abstract class MobileScannerPlatform extends PlatformInterface {
     List<BarcodeFormat> formats = const <BarcodeFormat>[],
   }) {
     throw UnimplementedError('analyzeImage() has not been implemented.');
+  }
+
+  /// Captures the next camera frame as JPEG bytes, independently of barcodes.
+  ///
+  /// Requires a running camera. Captures the full frame at the analysis
+  /// resolution, without applying the scan window or preview cropping.
+  Future<Uint8List> captureImage() {
+    throw UnimplementedError('captureImage() has not been implemented.');
   }
 
   /// Build the camera view for the barcode scanner.
