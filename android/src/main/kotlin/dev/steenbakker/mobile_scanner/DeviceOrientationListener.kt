@@ -17,9 +17,10 @@ import io.flutter.plugin.common.EventChannel
 /**
  * This class listens to display orientation changes.
  *
- * The orientation is determined from the display rotation rather than raw sensor data.
+ * The reported UI orientation is determined from display rotation.
  * This ensures that the reported orientation respects both the system rotation lock
  * and Flutter `SystemChrome.setPreferredOrientations`.
+ * Physical rotation is tracked separately for capture-only image encoding.
  */
 class DeviceOrientationListener(
     private val activity: Activity,
@@ -33,6 +34,12 @@ class DeviceOrientationListener(
 
     // Called with the new [Surface.ROTATION_*] value whenever the display rotation changes.
     var onDisplayRotationChanged: ((Int) -> Unit)? = null
+
+    // Capture-only target rotation, independent of rotation locks. Null until
+    // the sensor supplies a usable reading; capture then uses frame metadata.
+    @Volatile
+    var physicalRotation: Int? = null
+        private set
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -60,7 +67,8 @@ class DeviceOrientationListener(
     // fire (reliably) on rotation, e.g. seamless 180 degree rotations between
     // the two landscape orientations. The actual orientation is still read
     // from the display rotation in [checkRotation], so the system rotation
-    // lock and the app's preferred orientations remain respected.
+    // lock and the app's preferred orientations remain respected. Capture also
+    // keeps the sensor rotation separately, without publishing it as UI rotation.
     private var orientationEventListener: OrientationEventListener? = null
 
     private fun createOrientationEventListener() = object : OrientationEventListener(activity) {
@@ -69,6 +77,12 @@ class DeviceOrientationListener(
                 return
             }
             val quadrant = ((orientation + 45) / 90) % 4
+            physicalRotation = when (quadrant) {
+                1 -> Surface.ROTATION_270
+                2 -> Surface.ROTATION_180
+                3 -> Surface.ROTATION_90
+                else -> Surface.ROTATION_0
+            }
             if (quadrant != lastSensorQuadrant) {
                 lastSensorQuadrant = quadrant
                 // The display rotation usually settles some time after the
@@ -98,6 +112,7 @@ class DeviceOrientationListener(
         // initial orientation on the next camera start.
         lastOrientation = getUIOrientation()
         lastSensorQuadrant = -1
+        physicalRotation = null
         val displayManager = activity.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         displayManager.registerDisplayListener(displayListener, handler)
         val sensorListener = orientationEventListener
@@ -121,6 +136,7 @@ class DeviceOrientationListener(
      */
     fun stop() {
         orientationEventListener?.disable()
+        physicalRotation = null
         val displayManager = activity.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         displayManager.unregisterDisplayListener(displayListener)
         handler.removeCallbacks(rotationCheck)

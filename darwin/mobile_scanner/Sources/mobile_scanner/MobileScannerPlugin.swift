@@ -44,10 +44,14 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 
     private class ImageCaptureRequest {
         let result: FlutterResult
+        let rotationAngle: CGFloat?
         var claimed = false
         var timeout: DispatchWorkItem?
 
-        init(_ result: @escaping FlutterResult) { self.result = result }
+        init(_ result: @escaping FlutterResult, rotationAngle: CGFloat?) {
+            self.result = result
+            self.rotationAngle = rotationAngle
+        }
     }
 
     private let imageCaptureLock = NSLock()
@@ -66,7 +70,14 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
                                 message: "An image capture is already pending.", details: nil))
             return
         }
-        let request = ImageCaptureRequest(result)
+        // Sample gravity on the main queue at the shutter request, independently
+        // of the interface orientation used by the preview and Vision.
+#if os(iOS)
+        let rotationAngle = captureRotationAngle()
+#else
+        let rotationAngle: CGFloat? = nil
+#endif
+        let request = ImageCaptureRequest(result, rotationAngle: rotationAngle)
         pendingImageCapture = request
         imageCaptureLock.unlock()
 
@@ -96,7 +107,7 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         }
     }
 
-    private func captureNextImage(_ buffer: CVPixelBuffer) {
+    private func captureNextImage(_ buffer: CVPixelBuffer, connection: AVCaptureConnection) {
         imageCaptureLock.lock()
         guard let request = pendingImageCapture, !request.claimed else {
             imageCaptureLock.unlock()
@@ -108,6 +119,21 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         // Encode on the existing sample buffer queue, before barcode filtering.
         var image: CGImage?
         let status = VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &image)
+#if os(iOS)
+        if status == kCVReturnSuccess, let source = image, let targetAngle = request.rotationAngle {
+            let bufferAngle: CGFloat
+            if #available(iOS 17.0, *) {
+                bufferAngle = connection.videoRotationAngle
+            } else {
+                bufferAngle = Self.rotationAngle(for: connection.videoOrientation)
+            }
+            // The analysis buffer is already rotated for the UI. Apply only the
+            // remaining rotation to our copy; mirroring reverses its direction.
+            let correction = CapturedImageRotation.correction(
+                captureAngle: targetAngle, bufferAngle: bufferAngle, mirrored: connection.isVideoMirrored)
+            image = CapturedImageRotation.rotate(source, clockwiseDegrees: correction)
+        }
+#endif
         let bytes = status == kCVReturnSuccess ? image?.jpegData(compressionQuality: 0.8) : nil
         DispatchQueue.main.async { [weak self] in
             self?.completeImageCapture(request, bytes: bytes,
@@ -134,6 +160,9 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 
 #if os(iOS)
     var interfaceOrientationObserver: NSObjectProtocol?
+    // Type-erased so iOS 12–16 can still load the plugin. Accessed on main only.
+    private var captureRotationCoordinator: AnyObject?
+    private var physicalVideoOrientation: AVCaptureVideoOrientation = .portrait
 #endif
 
     /// Observer for the notification that the app is about to terminate.
@@ -329,7 +358,7 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         }
         latestBuffer = imageBuffer
         notifyFrameAvailable(for: textureId)
-        captureNextImage(imageBuffer)
+        captureNextImage(imageBuffer, connection: connection)
 
         let currentTime = Date().timeIntervalSince1970
         let eligibleForScan = currentTime > nextScanTime && !imagesCurrentlyBeingProcessed
@@ -885,14 +914,50 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 #if os(iOS)
     /// Set up observer for interface orientation changes
     private func setupInterfaceOrientationObserver() {
-        if #available(iOS 13.0, *) {
-            interfaceOrientationObserver = NotificationCenter.default.addObserver(
-                forName: UIDevice.orientationDidChangeNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
+        physicalVideoOrientation = getVideoOrientation()
+        if #available(iOS 17.0, *), let device = device {
+            captureRotationCoordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+        }
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        updatePhysicalVideoOrientation()
+        interfaceOrientationObserver = NotificationCenter.default.addObserver(
+            forName: UIDevice.orientationDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updatePhysicalVideoOrientation()
+            if #available(iOS 13.0, *) {
                 self?.updateVideoOrientationFromInterfaceOrientation()
             }
+        }
+    }
+
+    private func updatePhysicalVideoOrientation() {
+        switch UIDevice.current.orientation {
+        case .portrait: physicalVideoOrientation = .portrait
+        case .portraitUpsideDown: physicalVideoOrientation = .portraitUpsideDown
+        case .landscapeLeft: physicalVideoOrientation = .landscapeRight
+        case .landscapeRight: physicalVideoOrientation = .landscapeLeft
+        default: break // Keep the last usable orientation while flat/unknown.
+        }
+    }
+
+    private func captureRotationAngle() -> CGFloat {
+        if #available(iOS 17.0, *),
+           let coordinator = captureRotationCoordinator as? AVCaptureDevice.RotationCoordinator {
+            return coordinator.videoRotationAngleForHorizonLevelCapture
+        }
+        updatePhysicalVideoOrientation()
+        return Self.rotationAngle(for: physicalVideoOrientation)
+    }
+
+    private static func rotationAngle(for orientation: AVCaptureVideoOrientation) -> CGFloat {
+        switch orientation {
+        case .portrait: return 90
+        case .portraitUpsideDown: return 270
+        case .landscapeLeft: return 180
+        case .landscapeRight: return 0
+        @unknown default: return 90
         }
     }
 
@@ -901,7 +966,9 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         if let observer = interfaceOrientationObserver {
             NotificationCenter.default.removeObserver(observer)
             interfaceOrientationObserver = nil
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
         }
+        captureRotationCoordinator = nil
     }
 
     /// Update video orientation to match current interface orientation

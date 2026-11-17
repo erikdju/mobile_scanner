@@ -90,7 +90,7 @@ class MobileScanner(
     private var autoTorch: AutoTorch? = null
     private var torchStateCallback: TorchStateCallback? = null
 
-    private class ImageCaptureRequest(val result: MethodChannel.Result) {
+    private class ImageCaptureRequest(val result: MethodChannel.Result, val rotationDegrees: Int?) {
         val claimed = AtomicBoolean(false)
         var timeout: Runnable? = null
     }
@@ -103,7 +103,12 @@ class MobileScanner(
             result.error(MobileScannerErrorCodes.GENERIC_ERROR, "The camera is not running.", null)
             return
         }
-        val request = ImageCaptureRequest(result)
+        // Snapshot the physical rotation at the shutter request. CameraX handles
+        // sensor mounting and front/back lens direction without changing analysis.
+        val rotationDegrees = deviceOrientationListener.physicalRotation?.let {
+            camera?.cameraInfo?.getSensorRotationDegrees(it)
+        }
+        val request = ImageCaptureRequest(result, rotationDegrees)
         if (!pendingImageCapture.compareAndSet(null, request)) {
             result.error(MobileScannerErrorCodes.GENERIC_ERROR, "An image capture is already pending.", null)
             return
@@ -145,7 +150,7 @@ class MobileScanner(
             // Copy and encode while the analyzer owns the frame, before ML Kit
             // can close it. Capture is independent of scan throttling/inversion.
             bitmap = imageProxy.toBitmap()
-            rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            rotated = rotateBitmap(bitmap, request.rotationDegrees ?: imageProxy.imageInfo.rotationDegrees)
             val stream = ByteArrayOutputStream()
             check(rotated.compress(Bitmap.CompressFormat.JPEG, 80, stream)) {
                 "Could not encode the camera frame as JPEG."

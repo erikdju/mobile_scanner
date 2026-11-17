@@ -4,6 +4,7 @@ import android.app.Activity
 import android.graphics.Point
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.media.Image
 import android.os.Looper
 import android.util.Size
@@ -12,6 +13,7 @@ import androidx.camera.core.ImageInfo
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.SurfaceRequest
 import com.google.android.gms.tasks.OnCanceledListener
 import com.google.android.gms.tasks.OnFailureListener
@@ -36,6 +38,7 @@ import org.mockito.Mockito
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import java.time.Duration
 
 /*
@@ -55,6 +58,7 @@ internal class MobileScannerTest {
 
     private fun createMobileScanner(
         barcodeScanner: BarcodeScanner = Mockito.mock(BarcodeScanner::class.java),
+        orientationListener: DeviceOrientationListener = Mockito.mock(DeviceOrientationListener::class.java),
         inputImageFactory: (Image, Int) -> InputImage = { _, _ ->
             Mockito.mock(InputImage::class.java)
         },
@@ -64,7 +68,7 @@ internal class MobileScannerTest {
             Mockito.mock(TextureRegistry::class.java),
             { _: List<Map<String, Any?>>, _: ByteArray?, _: Int?, _: Int? -> },
             { _: String -> },
-            Mockito.mock(DeviceOrientationListener::class.java),
+            orientationListener,
             { _: BarcodeScannerOptions? -> barcodeScanner },
             inputImageFactory,
         ).also { it.scanner = barcodeScanner }
@@ -78,10 +82,13 @@ internal class MobileScannerTest {
         return barcode
     }
 
-    private fun createRunningMobileScanner(): MobileScanner {
-        val scanner = createMobileScanner()
+    private fun createRunningMobileScanner(
+        orientationListener: DeviceOrientationListener = Mockito.mock(DeviceOrientationListener::class.java),
+        camera: Camera = Mockito.mock(Camera::class.java),
+    ): MobileScanner {
+        val scanner = createMobileScanner(orientationListener = orientationListener)
         for ((name, value) in listOf(
-            "camera" to Mockito.mock(Camera::class.java),
+            "camera" to camera,
             "imageAnalysis" to Mockito.mock(ImageAnalysis::class.java),
         )) {
             MobileScanner::class.java.getDeclaredField(name).apply {
@@ -90,6 +97,51 @@ internal class MobileScannerTest {
             }
         }
         return scanner
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun captureImage_usesPhysicalRotationWhileAnalysisStaysLocked() {
+        val listener = Mockito.mock(DeviceOrientationListener::class.java)
+        val camera = Mockito.mock(Camera::class.java)
+        val cameraInfo = Mockito.mock(CameraInfo::class.java)
+        Mockito.`when`(camera.cameraInfo).thenReturn(cameraInfo)
+        // Include reverse orientations and sensor mounting angles. CameraX
+        // calculates the lens-specific correction from this target rotation.
+        val targets = listOf(Surface.ROTATION_0, Surface.ROTATION_90, Surface.ROTATION_180, Surface.ROTATION_270)
+        for ((target, degrees) in targets.zip(listOf(90, 0, 270, 180))) {
+            Mockito.`when`(listener.physicalRotation).thenReturn(target)
+            Mockito.`when`(cameraInfo.getSensorRotationDegrees(target)).thenReturn(degrees)
+            val scanner = createRunningMobileScanner(listener, camera)
+            val result = Mockito.mock(MethodChannel.Result::class.java)
+            val image = createImage(32, 16)
+            val bitmap = Bitmap.createBitmap(32, 16, Bitmap.Config.ARGB_8888)
+            bitmap.eraseColor(Color.RED)
+            for (x in 16 until 32) for (y in 0 until 16) bitmap.setPixel(x, y, Color.BLUE)
+            Mockito.`when`(image.toBitmap()).thenReturn(bitmap)
+            Mockito.`when`(image.imageInfo.rotationDegrees).thenReturn(90)
+
+            scanner.captureImage(result)
+            // The shutter snapshots orientation; later sensor changes must not
+            // change this request's JPEG orientation.
+            Mockito.`when`(listener.physicalRotation).thenReturn(null)
+            scanner.captureOutput.analyze(image)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val bytes = ArgumentCaptor.forClass(ByteArray::class.java)
+            Mockito.verify(result).success(bytes.capture())
+            val decoded = BitmapFactory.decodeByteArray(bytes.value, 0, bytes.value.size)
+            assertEquals(if (degrees % 180 == 0) 32 else 16, decoded.width)
+            assertEquals(if (degrees % 180 == 0) 16 else 32, decoded.height)
+            val topLeft = decoded.getPixel(4, 4)
+            if (degrees == 0 || degrees == 90) {
+                assertTrue(Color.red(topLeft) > Color.blue(topLeft))
+            } else {
+                assertTrue(Color.blue(topLeft) > Color.red(topLeft))
+            }
+            Mockito.verify(cameraInfo).getSensorRotationDegrees(target)
+            assertEquals(90, image.imageInfo.rotationDegrees)
+        }
     }
 
     @Test

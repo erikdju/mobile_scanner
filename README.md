@@ -290,8 +290,10 @@ final Uint8List jpegBytes = await controller.captureImage();
 Capture works without a detected barcode and with `returnImage: false`. It uses
 the existing camera session and returns the full frame at the analysis resolution,
 without the scan window, preview cropping, overlays, or front camera preview
-mirroring. JPEG quality is 80%. Android applies the frame's rotation; Apple
-platforms use the existing video output orientation. Web uses the video resolution
+mirroring. JPEG quality is 80%. Android and iOS orient captured images using the
+device's physical orientation, even when the UI orientation is locked. This
+capture-only correction leaves the preview and barcode coordinates unchanged.
+macOS uses the existing video output orientation. Web uses the video resolution
 and requires browser support for `requestVideoFrameCallback`.
 
 Only one capture can be pending at a time. A stopped or paused camera, an
